@@ -354,6 +354,8 @@ h2 {
 }
 
 /* Tool icon palette */
+.tool-icon.icon-video-compress { background: #fee2e2; color: #dc2626; }
+.tool-icon.icon-video-convert { background: #fef3c7; color: #d97706; }
 .tool-icon.icon-convert { background: #f5dccf; color: #df623d; }
 .tool-icon.icon-compress { background: #f8ebbf; color: #a97a21; }
 .tool-icon.icon-resize { background: #d5e8e0; color: #367460; }
@@ -364,6 +366,8 @@ h2 {
 .tool-icon.icon-ppt { background: #ffedd5; color: #c2410c; }
 .tool-icon.icon-qr { background: #dce3f3; color: #546990; }
 
+.file-badge.badge-video { background: #fee2e2; color: #b91c1c; }
+.file-badge.badge-audio { background: #ecfdf5; color: #047857; }
 .file-badge.badge-pptx { background: #ffedd5; color: #c2410c; }
 .file-badge.badge-docx { background: #e0e7ff; color: #3730a3; }
 
@@ -651,6 +655,38 @@ input[type=range] {
 .process {
   display: block;
   margin-left: auto;
+}
+
+/* Progress bar & FFmpeg live stats */
+.progress-container {
+  width: 100%;
+  margin-top: 18px;
+  background: #e3ece6;
+  border-radius: 100px;
+  height: 8px;
+  overflow: hidden;
+  position: relative;
+}
+
+.progress-bar-fill {
+  background: linear-gradient(90deg, #173b30, #e25f39);
+  height: 100%;
+  border-radius: 100px;
+  transition: width 0.25s ease;
+}
+
+.progress-info {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 7px;
+  font-size: 11px;
+  color: #556c63;
+  font-family: 'DM Mono', monospace;
+}
+
+.progress-info b {
+  color: #e25f39;
 }
 
 /* Spinner */

@@ -4,16 +4,21 @@ import { PDFDocument } from 'pdf-lib'
 import QRCode from 'qrcode'
 import JSZip from 'jszip'
 import { Document, Packer, Paragraph, TextRun, HeadingLevel } from 'docx'
+import { FFmpeg } from '@ffmpeg/ffmpeg'
+import { fetchFile, toBlobURL } from '@ffmpeg/util'
 import './styles.css'
 
 const categories = [
   { id: 'all', label: 'All Tools' },
+  { id: 'video', label: 'Video & Audio' },
   { id: 'docs', label: 'PDF & Docs' },
   { id: 'image', label: 'Images' },
   { id: 'utility', label: 'Utilities' },
 ]
 
 const tools = [
+  { id: 'video-compress', icon: '🎬', iconClass: 'icon-video-compress', category: 'video', title: 'Video Compressor', text: 'Shrink MP4, WebM & MOV file sizes fast without quality loss.' },
+  { id: 'video-convert', icon: '📽', iconClass: 'icon-video-convert', category: 'video', title: 'Video Converter', text: 'Convert videos to MP4, WebM, animated GIF, or extract MP3 audio.' },
   { id: 'convert', icon: '⇄', iconClass: 'icon-convert', category: 'image', title: 'Image Converter', text: 'Convert JPG, PNG and WebP images in seconds.' },
   { id: 'compress', icon: '◒', iconClass: 'icon-compress', category: 'image', title: 'Image Compressor', text: 'Make image files smaller without losing quality.' },
   { id: 'resize', icon: '⛶', iconClass: 'icon-resize', category: 'image', title: 'Image Resizer', text: 'Resize images to the exact dimensions you need.' },
@@ -429,8 +434,31 @@ async function compressToTargetSize(file, targetMB, onProgress) {
 
     const quality = Math.max(0.25, Math.min(0.85, ratio))
     return await new Promise((res) => canvas.toBlob(res, 'image/jpeg', quality))
+  } else if (file.type.startsWith('video/') || /\.(mp4|webm|mov|avi|mkv|wmv|m4v|flv)$/i.test(file.name)) {
+    let preset = 'balanced'
+    let customCrf = 28
+    let resCap = '720'
+    if (ratio < 0.25) {
+      preset = 'custom'
+      customCrf = 34
+      resCap = '480'
+    } else if (ratio < 0.5) {
+      preset = 'space-saver'
+      customCrf = 31
+      resCap = '480'
+    } else if (ratio < 0.8) {
+      preset = 'balanced'
+      customCrf = 28
+      resCap = '720'
+    } else {
+      preset = 'hd'
+      customCrf = 24
+      resCap = '1080'
+    }
+    onProgress?.(`Calibrating video compression to fit under ${targetMB} MB...`)
+    return await compressVideoFile(file, preset, customCrf, resCap, null, onProgress)
   } else {
-    throw new Error('Please upload a PDF or Image file for target compression.')
+    throw new Error('Please upload a PDF, Video, or Image file for target compression.')
   }
 }
 
@@ -515,6 +543,197 @@ async function convertImageTo1080p(file, mode, applySharpening, format, onProgre
   return await new Promise((res) => canvas.toBlob(res, mimeType, quality))
 }
 
+// FFmpeg singleton & callback management
+let ffmpegInstance = null
+let ffmpegLoadingPromise = null
+let ffmpegProgressCallback = null
+let ffmpegLogCallback = null
+
+async function getFFmpeg(onStatus, onProgress) {
+  ffmpegProgressCallback = onProgress
+  ffmpegLogCallback = onStatus
+
+  if (ffmpegInstance && ffmpegInstance.loaded) {
+    return ffmpegInstance
+  }
+
+  if (ffmpegLoadingPromise) {
+    return await ffmpegLoadingPromise
+  }
+
+  ffmpegLoadingPromise = (async () => {
+    onStatus?.('Loading FFmpeg engine (~30MB once, cached in browser)...')
+    const ffmpeg = new FFmpeg()
+
+    ffmpeg.on('progress', ({ progress }) => {
+      const pct = Math.min(100, Math.max(0, Math.round(progress * 100)))
+      if (ffmpegProgressCallback) {
+        ffmpegProgressCallback(pct)
+      }
+    })
+
+    ffmpeg.on('log', ({ message }) => {
+      console.log('[FFmpeg]', message)
+      if (ffmpegLogCallback && typeof message === 'string') {
+        if (message.includes('frame=') || message.includes('size=')) {
+          const stats = message.trim().replace(/\s+/g, ' ')
+          ffmpegLogCallback(`Encoding: ${stats}`)
+        }
+      }
+    })
+
+    const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/esm'
+    try {
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      })
+    } catch (err) {
+      console.warn('Unpkg failed or blocked, trying jsdelivr CDN...', err)
+      onStatus?.('Connecting to backup CDN for FFmpeg core...')
+      const fallbackURL = 'https://cdn.jsdelivr.net/npm/@ffmpeg/core@0.12.6/dist/esm'
+      await ffmpeg.load({
+        coreURL: await toBlobURL(`${fallbackURL}/ffmpeg-core.js`, 'text/javascript'),
+        wasmURL: await toBlobURL(`${fallbackURL}/ffmpeg-core.wasm`, 'application/wasm'),
+      })
+    }
+
+    ffmpegInstance = ffmpeg
+    return ffmpegInstance
+  })()
+
+  try {
+    return await ffmpegLoadingPromise
+  } catch (err) {
+    ffmpegLoadingPromise = null
+    throw err
+  }
+}
+
+// 5. Video Compressor via client-side FFmpeg
+async function compressVideoFile(file, preset, customCrf, resolutionCap, onProgress, onStatus) {
+  onStatus?.('Initializing FFmpeg WebAssembly engine...')
+  const ffmpeg = await getFFmpeg(onStatus, onProgress)
+
+  const inExt = (file.name.split('.').pop() || 'mp4').toLowerCase()
+  const uid = Math.random().toString(36).substring(2, 8)
+  const inputName = `input_${uid}.${inExt}`
+  const outputName = `output_${uid}.mp4`
+
+  onStatus?.('Loading video into memory...')
+  await ffmpeg.writeFile(inputName, await fetchFile(file))
+
+  let crf = 28
+  let scaleFilter = "scale='min(1280,iw)':-2"
+
+  if (preset === 'balanced') {
+    crf = 28
+    scaleFilter = "scale='min(1280,iw)':-2"
+  } else if (preset === 'space-saver') {
+    crf = 32
+    scaleFilter = "scale='min(854,iw)':-2"
+  } else if (preset === 'hd') {
+    crf = 23
+    scaleFilter = "scale='min(1920,iw)':-2"
+  } else if (preset === 'custom') {
+    crf = customCrf || 28
+    if (resolutionCap === '1080') scaleFilter = "scale='min(1920,iw)':-2"
+    else if (resolutionCap === '720') scaleFilter = "scale='min(1280,iw)':-2"
+    else if (resolutionCap === '480') scaleFilter = "scale='min(854,iw)':-2"
+    else scaleFilter = 'scale=trunc(iw/2)*2:trunc(ih/2)*2'
+  }
+
+  onStatus?.('Transcoding and compressing video...')
+  try {
+    await ffmpeg.exec([
+      '-i', inputName,
+      '-vf', scaleFilter,
+      '-c:v', 'libx264',
+      '-crf', String(crf),
+      '-preset', 'ultrafast',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
+      outputName,
+    ])
+
+    const data = await ffmpeg.readFile(outputName)
+    return new Blob([data.buffer], { type: 'video/mp4' })
+  } finally {
+    await ffmpeg.deleteFile(inputName).catch(() => {})
+    await ffmpeg.deleteFile(outputName).catch(() => {})
+  }
+}
+
+// 6. Video Converter (MP4, WebM, Animated GIF, MP3 Audio) via client-side FFmpeg
+async function convertVideoFile(file, targetFormat, gifFps, gifWidth, mp3Bitrate, onProgress, onStatus) {
+  onStatus?.('Initializing FFmpeg WebAssembly engine...')
+  const ffmpeg = await getFFmpeg(onStatus, onProgress)
+
+  const inExt = (file.name.split('.').pop() || 'mp4').toLowerCase()
+  const uid = Math.random().toString(36).substring(2, 8)
+  const inputName = `input_${uid}.${inExt}`
+  const targetExt = targetFormat === 'gif' ? 'gif' : targetFormat === 'mp3' ? 'mp3' : targetFormat === 'webm' ? 'webm' : 'mp4'
+  const outputName = `output_${uid}.${targetExt}`
+
+  onStatus?.('Loading media into memory...')
+  await ffmpeg.writeFile(inputName, await fetchFile(file))
+
+  const args = ['-i', inputName]
+  let mimeType = 'video/mp4'
+
+  if (targetFormat === 'mp4') {
+    mimeType = 'video/mp4'
+    args.push(
+      '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2',
+      '-c:v', 'libx264',
+      '-preset', 'ultrafast',
+      '-crf', '23',
+      '-c:a', 'aac',
+      '-b:a', '128k',
+      '-movflags', '+faststart',
+      outputName
+    )
+  } else if (targetFormat === 'webm') {
+    mimeType = 'video/webm'
+    args.push(
+      '-c:v', 'libvpx',
+      '-b:v', '1M',
+      '-crf', '28',
+      '-c:a', 'libvorbis',
+      outputName
+    )
+  } else if (targetFormat === 'gif') {
+    mimeType = 'image/gif'
+    const fps = gifFps || 12
+    const width = gifWidth || 480
+    args.push(
+      '-vf', `fps=${fps},scale='min(${width},iw)':-2:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse`,
+      '-loop', '0',
+      outputName
+    )
+  } else if (targetFormat === 'mp3') {
+    mimeType = 'audio/mp3'
+    const bitrate = mp3Bitrate || '192k'
+    args.push(
+      '-vn',
+      '-c:a', 'libmp3lame',
+      '-b:a', bitrate,
+      outputName
+    )
+  }
+
+  onStatus?.(`Converting to ${targetFormat.toUpperCase()}...`)
+  try {
+    await ffmpeg.exec(args)
+    const data = await ffmpeg.readFile(outputName)
+    return new Blob([data.buffer], { type: mimeType })
+  } finally {
+    await ffmpeg.deleteFile(inputName).catch(() => {})
+    await ffmpeg.deleteFile(outputName).catch(() => {})
+  }
+}
+
 function App() {
   const [activeCategory, setActiveCategory] = useState('all')
   const [activeTool, setActiveTool] = useState('convert')
@@ -525,7 +744,17 @@ function App() {
   const [pdfPages, setPdfPages] = useState(0)
   const [pdfPreset, setPdfPreset] = useState('balanced')
   
-  // New tool states
+  // Video tool states
+  const [videoPreset, setVideoPreset] = useState('balanced') // 'balanced' | 'space-saver' | 'hd' | 'custom'
+  const [videoCrf, setVideoCrf] = useState(28)
+  const [videoResCap, setVideoResCap] = useState('720')
+  const [videoConvertFormat, setVideoConvertFormat] = useState('mp4') // 'mp4' | 'webm' | 'gif' | 'mp3'
+  const [gifFps, setGifFps] = useState(12)
+  const [gifWidth, setGifWidth] = useState(480)
+  const [mp3Bitrate, setMp3Bitrate] = useState('192k')
+  const [videoDuration, setVideoDuration] = useState(0)
+
+  // Document & Image tool states
   const [targetMB, setTargetMB] = useState(50)
   const [includePptNotes, setIncludePptNotes] = useState(true)
   const [hdMode, setHdMode] = useState('landscape') // 'landscape' | 'portrait' | 'square' | 'height'
@@ -534,6 +763,7 @@ function App() {
 
   const [isProcessing, setIsProcessing] = useState(false)
   const [progressText, setProgressText] = useState('')
+  const [progressPercent, setProgressPercent] = useState(0)
   const [result, setResult] = useState(null)
   const inputRef = useRef(null)
 
@@ -547,6 +777,7 @@ function App() {
     setActiveTool(id)
     setResult(null)
     setProgressText('')
+    setProgressPercent(0)
     setFile(null)
   }
 
@@ -557,6 +788,10 @@ function App() {
     setFile(next)
     setResult(null)
     setProgressText('')
+    setProgressPercent(0)
+    setDimensions({ width: '', height: '' })
+    setPdfPages(0)
+    setVideoDuration(0)
 
     if (next.type.includes('pdf') || next.name.toLowerCase().endsWith('.pdf')) {
       try {
@@ -570,6 +805,14 @@ function App() {
       const image = new Image()
       image.onload = () => setDimensions({ width: String(image.width), height: String(image.height) })
       image.src = URL.createObjectURL(next)
+    } else if (next.type.startsWith('video/') || /\.(mp4|webm|mov|avi|mkv|wmv|m4v|flv)$/i.test(next.name)) {
+      const video = document.createElement('video')
+      video.preload = 'metadata'
+      video.onloadedmetadata = () => {
+        setDimensions({ width: String(video.videoWidth || ''), height: String(video.videoHeight || '') })
+        setVideoDuration(video.duration || 0)
+      }
+      video.src = URL.createObjectURL(next)
     }
   }
 
@@ -744,8 +987,89 @@ function App() {
     }
   }
 
+  // 5. Video Compressor via FFmpeg WASM
+  const processVideoCompress = async () => {
+    if (!file) return
+    setIsProcessing(true)
+    setProgressPercent(0)
+    setProgressText('Starting video compression...')
+    try {
+      const compressedBlob = await compressVideoFile(
+        file,
+        videoPreset,
+        videoCrf,
+        videoResCap,
+        (pct) => setProgressPercent(pct),
+        (msg) => setProgressText(msg)
+      )
+      const savingsPercent = Math.max(0, Math.round(((file.size - compressedBlob.size) / file.size) * 100))
+      const baseName = (file.name || 'video').replace(/\.[^.]+$/, '')
+      const filename = `${baseName}-compressed.mp4`
+      setResult({
+        url: URL.createObjectURL(compressedBlob),
+        blob: compressedBlob,
+        name: file.name,
+        filename,
+        size: compressedBlob.size,
+        originalSize: file.size,
+        savingsPercent,
+        type: 'video/mp4',
+        isVideo: true,
+      })
+    } catch (err) {
+      console.error(err)
+      alert(`Could not compress video. ${err.message || 'Please verify file format and try again.'}`)
+    } finally {
+      setIsProcessing(false)
+      setProgressText('')
+      setProgressPercent(0)
+    }
+  }
+
+  // 6. Video Converter via FFmpeg WASM
+  const processVideoConvert = async () => {
+    if (!file) return
+    setIsProcessing(true)
+    setProgressPercent(0)
+    setProgressText(`Preparing conversion to ${videoConvertFormat.toUpperCase()}...`)
+    try {
+      const convertedBlob = await convertVideoFile(
+        file,
+        videoConvertFormat,
+        gifFps,
+        gifWidth,
+        mp3Bitrate,
+        (pct) => setProgressPercent(pct),
+        (msg) => setProgressText(msg)
+      )
+      const targetExt = videoConvertFormat === 'gif' ? 'gif' : videoConvertFormat === 'mp3' ? 'mp3' : videoConvertFormat === 'webm' ? 'webm' : 'mp4'
+      const baseName = (file.name || 'video').replace(/\.[^.]+$/, '')
+      const filename = `${baseName}-toolbox.${targetExt}`
+      setResult({
+        url: URL.createObjectURL(convertedBlob),
+        blob: convertedBlob,
+        name: file.name,
+        filename,
+        size: convertedBlob.size,
+        type: convertedBlob.type,
+        isVideo: videoConvertFormat === 'mp4' || videoConvertFormat === 'webm',
+        isAudio: videoConvertFormat === 'mp3',
+        isGif: videoConvertFormat === 'gif',
+      })
+    } catch (err) {
+      console.error(err)
+      alert(`Could not convert video. ${err.message || 'Please try another format.'}`)
+    } finally {
+      setIsProcessing(false)
+      setProgressText('')
+      setProgressPercent(0)
+    }
+  }
+
   const handleProcess = () => {
-    if (activeTool === 'pdf') processPdf()
+    if (activeTool === 'video-compress') processVideoCompress()
+    else if (activeTool === 'video-convert') processVideoConvert()
+    else if (activeTool === 'pdf') processPdf()
     else if (activeTool === 'pdf-to-word') processPdfToWord()
     else if (activeTool === 'compress-50mb') processTargetCompress()
     else if (activeTool === 'ppt-to-word') processPptToWord()
@@ -754,16 +1078,19 @@ function App() {
   }
 
   const getAcceptTypes = () => {
+    if (activeTool === 'video-compress' || activeTool === 'video-convert') return 'video/*,.mp4,.webm,.mov,.avi,.mkv,.wmv,.m4v,.flv'
     if (activeTool === 'pdf' || activeTool === 'pdf-to-word') return 'application/pdf,.pdf'
     if (activeTool === 'ppt-to-word') return '.pptx,application/vnd.openxmlformats-officedocument.presentationml.presentation'
-    if (activeTool === 'compress-50mb') return 'application/pdf,.pdf,image/*'
+    if (activeTool === 'compress-50mb') return 'application/pdf,.pdf,image/*,video/*'
     return 'image/*'
   }
 
   const getDropzoneSubtitle = () => {
+    if (activeTool === 'video-compress') return 'MP4, WebM, MOV, AVI, MKV · Compress file size with client-side FFmpeg'
+    if (activeTool === 'video-convert') return 'MP4, WebM, MOV, AVI · Convert to MP4, WebM, animated GIF, or MP3 audio'
     if (activeTool === 'pdf-to-word') return 'PDF documents · Converted to editable Word (.docx)'
     if (activeTool === 'ppt-to-word') return 'PowerPoint (.pptx) · Formatted into Word notes'
-    if (activeTool === 'compress-50mb') return 'PDF or Media files · Fit under 50 MB, 25 MB, or custom target'
+    if (activeTool === 'compress-50mb') return 'PDF, Video, or Media files · Fit under 50 MB, 25 MB, or custom target'
     if (activeTool === 'hd-1080') return 'PNG, JPG, WebP · Enhanced & scaled to 1080p Full HD'
     if (activeTool === 'pdf') return 'PDF files · Up to 50MB · 100% Client-Side & Private'
     return 'JPG, PNG or WebP · Max 20MB'
@@ -775,6 +1102,8 @@ function App() {
     if (name.endsWith('.pdf')) return 'PDF'
     if (name.endsWith('.pptx')) return 'PPTX'
     if (name.endsWith('.docx')) return 'DOCX'
+    if (file.type.startsWith('video/') || /\.(mp4|webm|mov|avi|mkv|wmv|m4v|flv)$/i.test(name)) return 'VIDEO'
+    if (file.type.startsWith('audio/') || /\.(mp3|wav|ogg|m4a|aac)$/i.test(name)) return 'AUDIO'
     if (file.type.includes('png')) return 'PNG'
     if (file.type.includes('webp')) return 'WEBP'
     return 'JPG'
@@ -785,6 +1114,8 @@ function App() {
     if (badge === 'PDF') return 'badge-pdf'
     if (badge === 'PPTX') return 'badge-pptx'
     if (badge === 'DOCX') return 'badge-docx'
+    if (badge === 'VIDEO') return 'badge-video'
+    if (badge === 'AUDIO') return 'badge-audio'
     return ''
   }
 
@@ -807,7 +1138,7 @@ function App() {
           <div className="hero-copy">
             <p className="kicker"><span className="spark">✦</span>SIMPLE ONLINE UTILITIES</p>
             <h1>Small tools.<br /><em>Big relief.</em></h1>
-            <p className="hero-text">Fast, private and beautifully simple tools for everyday tasks — now with PDF to Word, PPT notes, target compressor, and 1080p HD.</p>
+            <p className="hero-text">Fast, private and beautifully simple tools for everyday tasks — now with client-side Video Compressor, Video & Audio Converter, PDF to Word, and 1080p HD.</p>
             <div className="hero-actions">
               <button className="primary" onClick={() => document.querySelector('#tools')?.scrollIntoView({ behavior: 'smooth' })}>
                 Try a tool <span>→</span>
@@ -890,7 +1221,11 @@ function App() {
                   />
                   <span className="upload-mark">↑</span>
                   <strong>
-                    {activeTool === 'pdf' || activeTool === 'pdf-to-word'
+                    {activeTool === 'video-compress'
+                      ? 'Drop your video here to compress'
+                      : activeTool === 'video-convert'
+                      ? 'Drop your video here to convert'
+                      : activeTool === 'pdf' || activeTool === 'pdf-to-word'
                       ? 'Drop your PDF here'
                       : activeTool === 'ppt-to-word'
                       ? 'Drop your PowerPoint (.pptx) here'
@@ -913,16 +1248,162 @@ function App() {
                       <strong>{file.name}</strong>
                       <span>
                         {(file.size / 1024 / 1024).toFixed(2)} MB
+                        {videoDuration > 0 ? ` · ${Math.floor(videoDuration / 60)}:${String(Math.floor(videoDuration % 60)).padStart(2, '0')}` : ''}
                         {pdfPages > 0 ? ` · ${pdfPages} page${pdfPages > 1 ? 's' : ''}` : ''}
                         {dimensions.width ? ` · ${dimensions.width} × ${dimensions.height}px` : ''}
                       </span>
                     </div>
-                    <button className="remove" onClick={() => { setFile(null); setResult(null); setProgressText(''); }}>
+                    <button className="remove" onClick={() => { setFile(null); setResult(null); setProgressText(''); setProgressPercent(0); }}>
                       ×
                     </button>
                   </div>
 
                   <div className="options">
+                    {/* Video Compressor */}
+                    {activeTool === 'video-compress' && (
+                      <>
+                        <div className="pdf-presets-container">
+                          <span className="preset-title">Compression Preset</span>
+                          <div className="preset-group">
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoPreset === 'balanced' ? 'active' : ''}`}
+                              onClick={() => { setVideoPreset('balanced'); setResult(null); }}
+                            >
+                              <b>Balanced 720p (Recommended)</b>
+                              <small>Up to 70% smaller · Sharp & easy to share</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoPreset === 'space-saver' ? 'active' : ''}`}
+                              onClick={() => { setVideoPreset('space-saver'); setResult(null); }}
+                            >
+                              <b>Space Saver 480p</b>
+                              <small>Maximum reduction · Fits email & Discord</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoPreset === 'hd' ? 'active' : ''}`}
+                              onClick={() => { setVideoPreset('hd'); setResult(null); }}
+                            >
+                              <b>High Quality 1080p</b>
+                              <small>Crisp Full HD · Modest size reduction</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoPreset === 'custom' ? 'active' : ''}`}
+                              onClick={() => { setVideoPreset('custom'); setResult(null); }}
+                            >
+                              <b>Custom Tuning</b>
+                              <small>Adjust CRF slider & resolution cap</small>
+                            </button>
+                          </div>
+                        </div>
+
+                        {videoPreset === 'custom' && (
+                          <div style={{ display: 'flex', gap: '20px', width: '100%', flexWrap: 'wrap', marginTop: '10px' }}>
+                            <label className="range-label">
+                              Compression Factor (CRF) <b>{videoCrf}</b> (18 = Highest Quality, 36 = Smallest)
+                              <input
+                                type="range"
+                                min="18"
+                                max="36"
+                                value={videoCrf}
+                                onChange={(e) => { setVideoCrf(Number(e.target.value)); setResult(null); }}
+                              />
+                            </label>
+                            <label>
+                              Max Resolution
+                              <select value={videoResCap} onChange={(e) => { setVideoResCap(e.target.value); setResult(null); }}>
+                                <option value="original">Original Dimensions</option>
+                                <option value="1080">Cap at 1080p</option>
+                                <option value="720">Cap at 720p</option>
+                                <option value="480">Cap at 480p</option>
+                              </select>
+                            </label>
+                          </div>
+                        )}
+                      </>
+                    )}
+
+                    {/* Video Converter */}
+                    {activeTool === 'video-convert' && (
+                      <>
+                        <div className="pdf-presets-container">
+                          <span className="preset-title">Target Output Format</span>
+                          <div className="preset-group">
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoConvertFormat === 'mp4' ? 'active' : ''}`}
+                              onClick={() => { setVideoConvertFormat('mp4'); setResult(null); }}
+                            >
+                              <b>MP4 Video (H.264)</b>
+                              <small>Universal playback on all phones & web</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoConvertFormat === 'webm' ? 'active' : ''}`}
+                              onClick={() => { setVideoConvertFormat('webm'); setResult(null); }}
+                            >
+                              <b>WebM Video</b>
+                              <small>Modern open HTML5 web video</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoConvertFormat === 'gif' ? 'active' : ''}`}
+                              onClick={() => { setVideoConvertFormat('gif'); setResult(null); }}
+                            >
+                              <b>Animated GIF</b>
+                              <small>High quality 2-pass looping animation</small>
+                            </button>
+                            <button
+                              type="button"
+                              className={`preset-btn ${videoConvertFormat === 'mp3' ? 'active' : ''}`}
+                              onClick={() => { setVideoConvertFormat('mp3'); setResult(null); }}
+                            >
+                              <b>Extract MP3 Audio</b>
+                              <small>Rip sound track to high quality MP3</small>
+                            </button>
+                          </div>
+                        </div>
+
+                        {videoConvertFormat === 'gif' && (
+                          <div style={{ display: 'flex', gap: '20px', width: '100%', flexWrap: 'wrap', marginTop: '12px' }}>
+                            <label>
+                              GIF Frame Rate
+                              <select value={gifFps} onChange={(e) => { setGifFps(Number(e.target.value)); setResult(null); }}>
+                                <option value={10}>10 FPS (Smallest file)</option>
+                                <option value={12}>12 FPS (Balanced - recommended)</option>
+                                <option value={15}>15 FPS (Smooth)</option>
+                                <option value={20}>20 FPS (Very smooth)</option>
+                              </select>
+                            </label>
+                            <label>
+                              Max Width
+                              <select value={gifWidth} onChange={(e) => { setGifWidth(Number(e.target.value)); setResult(null); }}>
+                                <option value={360}>360px (Compact)</option>
+                                <option value={480}>480px (Standard - recommended)</option>
+                                <option value={640}>640px (High definition)</option>
+                              </select>
+                            </label>
+                          </div>
+                        )}
+
+                        {videoConvertFormat === 'mp3' && (
+                          <div style={{ display: 'flex', gap: '20px', width: '100%', flexWrap: 'wrap', marginTop: '12px' }}>
+                            <label>
+                              Audio Bitrate
+                              <select value={mp3Bitrate} onChange={(e) => { setMp3Bitrate(e.target.value); setResult(null); }}>
+                                <option value="128k">128 kbps (Standard speech & podcasts)</option>
+                                <option value="192k">192 kbps (High quality music & stereo)</option>
+                                <option value="320k">320 kbps (Maximum fidelity)</option>
+                              </select>
+                            </label>
+                          </div>
+                        )}
+                      </>
+                    )}
+
                     {/* Convert */}
                     {activeTool === 'convert' && (
                       <label>
@@ -1139,6 +1620,21 @@ function App() {
                     )}
                   </div>
 
+                  {isProcessing && (
+                    <div style={{ width: '100%', marginBottom: '18px' }}>
+                      <div className="progress-container">
+                        <div
+                          className="progress-bar-fill"
+                          style={{ width: `${Math.max(6, progressPercent)}%` }}
+                        />
+                      </div>
+                      <div className="progress-info">
+                        <span>{progressText || 'Processing with client-side FFmpeg...'}</span>
+                        <span>{progressPercent > 0 ? <b>{progressPercent}%</b> : ''}</span>
+                      </div>
+                    </div>
+                  )}
+
                   {!result ? (
                     <button
                       className="primary process"
@@ -1147,11 +1643,15 @@ function App() {
                     >
                       {isProcessing ? (
                         <>
-                          <span className="spinner">◌</span> {progressText || 'Processing...'}
+                          <span className="spinner">◌</span> {progressPercent > 0 ? `${progressPercent}%` : 'Processing...'}
                         </>
                       ) : (
                         <>
-                          {activeTool === 'pdf-to-word'
+                          {activeTool === 'video-compress'
+                            ? 'Compress Video'
+                            : activeTool === 'video-convert'
+                            ? (videoConvertFormat === 'mp3' ? 'Extract MP3 Audio' : videoConvertFormat === 'gif' ? 'Convert to GIF' : `Convert to ${videoConvertFormat.toUpperCase()}`)
+                            : activeTool === 'pdf-to-word'
                             ? 'Convert to Word (.docx)'
                             : activeTool === 'ppt-to-word'
                             ? 'Generate Word Notes (.docx)'
@@ -1172,7 +1672,7 @@ function App() {
                   ) : (
                     <div className="result">
                       <span>✓</span>
-                      <div>
+                      <div style={{ flex: 1 }}>
                         <strong>Your file is ready!</strong>
                         <small>
                           {(result.size / 1024 / 1024).toFixed(2)} MB output
@@ -1183,6 +1683,27 @@ function App() {
                             <span className="savings-badge">Ready</span>
                           )}
                         </small>
+                        {result.isVideo && (
+                          <video
+                            src={result.url}
+                            controls
+                            style={{ maxWidth: '100%', maxHeight: '200px', marginTop: '10px', borderRadius: '4px', display: 'block' }}
+                          />
+                        )}
+                        {result.isAudio && (
+                          <audio
+                            src={result.url}
+                            controls
+                            style={{ width: '100%', marginTop: '10px', display: 'block' }}
+                          />
+                        )}
+                        {result.isGif && (
+                          <img
+                            src={result.url}
+                            alt="Converted GIF"
+                            style={{ maxWidth: '100%', maxHeight: '200px', marginTop: '10px', borderRadius: '4px', display: 'block' }}
+                          />
+                        )}
                       </div>
                       <div className="download-actions">
                         <a
@@ -1190,7 +1711,7 @@ function App() {
                           href={result.url}
                           download={result.filename || 'toolbox-output'}
                         >
-                          Download {result.filename?.endsWith('.docx') ? 'Word Doc ↓' : 'File ↓'}
+                          Download {result.filename?.endsWith('.docx') ? 'Word Doc ↓' : result.isVideo ? 'Video ↓' : result.isAudio ? 'Audio ↓' : result.isGif ? 'GIF ↓' : 'File ↓'}
                         </a>
                         <a
                           className="view-link"
