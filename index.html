@@ -3,8 +3,16 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#0f172a" />
-    <title>React App</title>
+    <meta name="theme-color" content="#173b30" />
+    <meta name="description" content="Toolbox - Free, client-side, privacy-first web utilities for image converting, compression, resizing, QR codes, and PDF compression." />
+    <title>Toolbox — Fast &amp; Private Online Utilities</title>
+    <!-- PDF.js for client-side PDF processing -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+      if (window.pdfjsLib) {
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+      }
+    </script>
   </head>
   <body>
     <div id="root"></div>
